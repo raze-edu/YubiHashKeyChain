@@ -1,4 +1,7 @@
 /.pytest_cache
+*/__pycache__
+/.venv
 /pyproject.toml
 /tests
 /yubihash.egg-info
+/dist
