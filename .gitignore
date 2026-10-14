@@ -1,0 +1,4 @@
+/.pytest_cache
+/pyproject.toml
+/tests
+/yubihash.egg-info
