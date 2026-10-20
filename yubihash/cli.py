@@ -21,7 +21,9 @@ from yubihash.backends.live.active_directory import LiveActiveDirectory
 from yubihash.backends.live.dpapi_ng import LiveDpapiNg
 from yubihash.backends.live.yubikey import LiveYubiKey
 from yubihash.backends.local.local_directory import DirectoryEntryNotFound
+from yubihash.archive import BlockPolicy
 from yubihash.cli_lab import lab_app, lab_dir_option, open_lab
+from yubihash.core.permissions import VaultPermission
 from yubihash.lab import LabEnvironment, LabError
 from yubihash.ledger.storage import VaultStorage
 from yubihash.vault import VaultOrchestrator
@@ -31,7 +33,10 @@ app = typer.Typer(
     help="Serverless AD + YubiKey Hash-Chain Vault CLI",
     add_completion=False,
 )
-app.add_typer(lab_app, name="lab")
+lab_app_instance = lab_app
+app.add_typer(lab_app_instance, name="lab")
+archive_app = typer.Typer(name="archive", help="Manage and interact with encrypted BinBin archive")
+app.add_typer(archive_app, name="archive")
 console = Console()
 
 
@@ -329,5 +334,165 @@ def onboard_cmd(
         raise typer.Exit(1)
 
 
+# ---------------------------------------------------------------------------
+# Archive Commands (BinBin Integration)
+# ---------------------------------------------------------------------------
+
+@archive_app.command("init")
+def archive_init_cmd(
+    vault_dir: Path = typer.Option(..., "--vault-dir", "-v", help="Path to vault folder on SMB share"),
+    group_sid: str = typer.Option(..., "--group-sid", "-g", help="Active Directory Security Group SID (lab mode: group name or SID)"),
+    block_size: int = typer.Option(4096, "--block-size", "-s", help="Usable block payload size in bytes"),
+    block_count: int = typer.Option(100, "--block-count", "-c", help="Number of blocks to pre-allocate"),
+    creator_sid: Optional[str] = typer.Option(None, "--creator-sid", help="SID of creator (defaults to current user)"),
+    pin: Optional[str] = typer.Option(None, "--pin", "-p", help="YubiKey PIN (if required)"),
+    lab_dir: Optional[Path] = lab_dir_option(required=False),
+):
+    """
+    Initializes a new encrypted BinBin archive in the vault with genesis block.
+    """
+    orchestrator, u_sid, lab = build_context(vault_dir, lab_dir, creator_sid)
+    if lab is not None:
+        try:
+            group_sid = lab.directory.resolve_group(group_sid)
+        except DirectoryEntryNotFound as e:
+            console.print(f"[red]{escape(str(e))}[/red]")
+            raise typer.Exit(1)
+
+    try:
+        blk, arc = orchestrator.init_archive(
+            group_sid=group_sid,
+            creator_sid=u_sid,
+            block_size=block_size,
+            block_count=block_count,
+            pin=pin,
+        )
+        console.print(f"[bold green]Secure BinBin archive initialized at {vault_dir}![/bold green]")
+        console.print(f"Blocks: {arc.block_count}, Usable Payload Size: {arc.payload_block_size} B, Physical Size: {arc.block_size} B")
+    except Exception as e:
+        console.print(f"[bold red]Archive initialization failed: {escape(str(e))}[/bold red]")
+        raise typer.Exit(1)
+
+
+@archive_app.command("read")
+def archive_read_cmd(
+    vault_dir: Path = typer.Option(..., "--vault-dir", "-v", help="Path to vault folder"),
+    block_index: int = typer.Option(..., "--block", "-b", help="Block index (0-based)"),
+    output_file: Optional[Path] = typer.Option(None, "--output-file", "-o", help="Optional output file path"),
+    pin: Optional[str] = typer.Option(None, "--pin", "-p", help="YubiKey PIN (if required)"),
+    user_sid: Optional[str] = typer.Option(None, "--user", "-u", help="Acting user SID / name"),
+    lab_dir: Optional[Path] = lab_dir_option(required=False),
+):
+    """
+    Reads and automatically decrypts a block from the archive (if authorized).
+    """
+    orchestrator, u_sid, _ = build_context(vault_dir, lab_dir, user_sid)
+    try:
+        with orchestrator.open_archive(current_user_sid=u_sid, pin=pin) as arc:
+            data = arc.read_block(block_index)
+            if output_file:
+                output_file.parent.mkdir(parents=True, exist_ok=True)
+                output_file.write_bytes(data)
+                console.print(f"[green]Wrote {len(data)} decrypted bytes to {output_file}[/green]")
+            else:
+                try:
+                    text = data.decode("utf-8")
+                    console.print(f"[bold cyan]Block {block_index} ({len(data)} bytes):[/bold cyan]\n{text}")
+                except UnicodeDecodeError:
+                    console.print(f"[bold cyan]Block {block_index} ({len(data)} bytes hex):[/bold cyan]\n{data.hex()}")
+    except Exception as e:
+        console.print(f"[bold red]Failed to read block: {escape(str(e))}[/bold red]")
+        raise typer.Exit(1)
+
+
+@archive_app.command("write")
+def archive_write_cmd(
+    vault_dir: Path = typer.Option(..., "--vault-dir", "-v", help="Path to vault folder"),
+    block_index: int = typer.Option(..., "--block", "-b", help="Block index (0-based)"),
+    data: Optional[str] = typer.Option(None, "--data", "-d", help="Plaintext string to write"),
+    input_file: Optional[Path] = typer.Option(None, "--input-file", "-i", help="File to read payload from"),
+    pin: Optional[str] = typer.Option(None, "--pin", "-p", help="YubiKey PIN (if required)"),
+    user_sid: Optional[str] = typer.Option(None, "--user", "-u", help="Acting user SID / name"),
+    lab_dir: Optional[Path] = lab_dir_option(required=False),
+):
+    """
+    Encrypts and writes data into a block in the archive (if authorized).
+    """
+    if data is None and input_file is None:
+        console.print("[red]Either --data or --input-file must be specified.[/red]")
+        raise typer.Exit(1)
+    payload = data.encode("utf-8") if data is not None else input_file.read_bytes()
+
+    orchestrator, u_sid, _ = build_context(vault_dir, lab_dir, user_sid)
+    try:
+        with orchestrator.open_archive(current_user_sid=u_sid, pin=pin) as arc:
+            arc.write_block(block_index, payload)
+            arc.flush()
+            console.print(f"[bold green]Successfully encrypted and wrote {len(payload)} bytes into block {block_index}![/bold green]")
+    except Exception as e:
+        console.print(f"[bold red]Failed to write block: {escape(str(e))}[/bold red]")
+        raise typer.Exit(1)
+
+
+@archive_app.command("info")
+def archive_info_cmd(
+    vault_dir: Path = typer.Option(..., "--vault-dir", "-v", help="Path to vault folder"),
+    pin: Optional[str] = typer.Option(None, "--pin", "-p", help="YubiKey PIN (if required)"),
+    user_sid: Optional[str] = typer.Option(None, "--user", "-u", help="Acting user SID / name"),
+    lab_dir: Optional[Path] = lab_dir_option(required=False),
+):
+    """
+    Displays metadata, usage statistics, and active user permissions for the archive.
+    """
+    orchestrator, u_sid, _ = build_context(vault_dir, lab_dir, user_sid)
+    try:
+        with orchestrator.open_archive(current_user_sid=u_sid, pin=pin, auto_sync=False) as arc:
+            table = Table(title="Secure BinBin Archive Information")
+            table.add_column("Property", style="bold cyan")
+            table.add_column("Value", style="green")
+            table.add_row("Path", str(arc.path))
+            table.add_row("Total Blocks", str(arc.block_count))
+            table.add_row("Used Blocks", str(arc.used_blocks))
+            table.add_row("Free Blocks", str(arc.free_blocks))
+            table.add_row("Physical Block Size", f"{arc.block_size} B")
+            table.add_row("Usable Payload Size", f"{arc.payload_block_size} B")
+            table.add_row("Acting User", u_sid)
+            table.add_row("Acting User Perms", ", ".join(arc.key.permissions))
+            console.print(table)
+    except Exception as e:
+        console.print(f"[bold red]Failed to inspect archive: {escape(str(e))}[/bold red]")
+        raise typer.Exit(1)
+
+
+@archive_app.command("set-policy")
+def archive_set_policy_cmd(
+    vault_dir: Path = typer.Option(..., "--vault-dir", "-v", help="Path to vault folder"),
+    range_spec: str = typer.Option(..., "--range", "-r", help="Block range (e.g. '0-10' or '5')"),
+    read_perm: Optional[str] = typer.Option(None, "--read-perm", help="Required read permission"),
+    write_perm: Optional[str] = typer.Option(None, "--write-perm", help="Required write permission"),
+    tier: Optional[str] = typer.Option(None, "--tier", "-t", help="Security tier (e.g. 'CONFIDENTIAL')"),
+    pin: Optional[str] = typer.Option(None, "--pin", "-p", help="YubiKey PIN (if required)"),
+    user_sid: Optional[str] = typer.Option(None, "--user", "-u", help="Acting user SID / name"),
+    lab_dir: Optional[Path] = lab_dir_option(required=False),
+):
+    """
+    Sets granular block access control requirements for a block range.
+    """
+    orchestrator, u_sid, _ = build_context(vault_dir, lab_dir, user_sid)
+    try:
+        user_key = orchestrator.get_user_key(u_sid, pin=pin)
+        if not user_key.has_capability(VaultPermission.CAN_GRANT_PERMISSIONS) and not user_key.has_capability(VaultPermission.CAN_MANAGE_ARCHIVE):
+            console.print("[red]User lacks CAN_GRANT_PERMISSIONS or CAN_MANAGE_ARCHIVE[/red]")
+            raise typer.Exit(1)
+        policy = orchestrator.storage.load_archive_policy() or BlockPolicy()
+        policy.set_range_rule(range_spec, read_permission=read_perm, write_permission=write_perm, tier=tier)
+        orchestrator.storage.write_archive_policy(policy)
+        console.print(f"[bold green]Updated block policy for range '{range_spec}' successfully![/bold green]")
+    except Exception as e:
+        console.print(f"[bold red]Failed to set policy: {escape(str(e))}[/bold red]")
+        raise typer.Exit(1)
+
+
 if __name__ == "__main__":
     app()
+

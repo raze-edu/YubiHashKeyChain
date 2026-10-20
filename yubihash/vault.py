@@ -15,6 +15,7 @@ from typing import Dict, List, Optional, Tuple, Union
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization
 
+from yubihash.archive import ArchiveUserKey, BlockPolicy, SecureBlockArchive
 from yubihash.backends.base import DirectoryBackend, DpapiNgBackend, YubiKeyBackend
 from yubihash.core.attestation import verify_piv_attestation
 from yubihash.core.crypto import (
@@ -183,6 +184,193 @@ class VaultOrchestrator:
                 pin=pin,
             )
 
+    def init_archive(
+        self,
+        group_sid: str,
+        creator_sid: str,
+        block_size: int,
+        block_count: int,
+        policy: Optional[BlockPolicy] = None,
+        pin: Optional[str] = None,
+        verify_member_attestation: bool = True,
+        raw_block_size: bool = False,
+    ) -> Tuple[Block, SecureBlockArchive]:
+        """
+        Initializes an encrypted BinBin archive in the vault on the SMB share.
+        Binds decryption to Active Directory group_sid and member YubiKeys.
+        Creates genesis.blk and pre-allocates archive.binbin.
+        """
+        self.storage.ensure_directories()
+
+        fek = os.urandom(32)
+        half_a = os.urandom(32)
+        half_b = os.urandom(32)
+
+        with SecureBuffer(fek) as s_fek, SecureBuffer(half_a) as s_ha, SecureBuffer(half_b) as s_hb:
+            kek = xor_bytes(s_ha.to_bytes(), s_hb.to_bytes())
+            with SecureBuffer(kek) as s_kek:
+                encrypted_fek = encrypt_aes_gcm_packed(s_kek.to_bytes(), s_fek.to_bytes())
+
+            protected_half_a = self.dpapi_ng.protect_secret(group_sid, s_ha.to_bytes())
+
+            creator_9c = self.yubikey.get_signing_certificate()
+            creator_9d = self.yubikey.get_decryption_certificate()
+            try:
+                creator_attest = self.yubikey.get_attestation_certificate("9d")
+                attest_der = creator_attest.public_bytes(serialization.Encoding.DER)
+            except Exception:
+                creator_attest = None
+                attest_der = None
+
+            creator_wrapped_b = wrap_half_b_ecc(creator_9d.public_key(), s_hb.to_bytes())
+
+            creator_dict = {
+                "user_sid": creator_sid,
+                "slot_9c_cert": base64.b64encode(creator_9c.public_bytes(serialization.Encoding.DER)).decode("ascii"),
+                "slot_9d_cert": base64.b64encode(creator_9d.public_bytes(serialization.Encoding.DER)).decode("ascii"),
+                "attestation_cert": base64.b64encode(attest_der).decode("ascii") if attest_der else None,
+                "wrapped_half_b": creator_wrapped_b,
+            }
+
+            initial_members = []
+            ad_members = self.directory.get_group_members(group_sid)
+            for m in ad_members:
+                if m.sid == creator_sid:
+                    continue
+                certs = self._extract_user_certs(m.certificates)
+                if certs:
+                    c_9c, c_9d, c_attest = certs
+                    if verify_member_attestation and self.root_ca_cert and c_attest:
+                        if not verify_piv_attestation(c_9d, c_attest, self.root_ca_cert):
+                            continue
+                    m_wrapped_b = wrap_half_b_ecc(c_9d.public_key(), s_hb.to_bytes())
+                    initial_members.append({
+                        "user_sid": m.sid,
+                        "slot_9c_cert": base64.b64encode(c_9c.public_bytes(serialization.Encoding.DER)).decode("ascii"),
+                        "slot_9d_cert": base64.b64encode(c_9d.public_bytes(serialization.Encoding.DER)).decode("ascii"),
+                        "attestation_cert": base64.b64encode(c_attest.public_bytes(serialization.Encoding.DER)).decode("ascii") if c_attest else None,
+                        "wrapped_half_b": m_wrapped_b,
+                        "permissions": DEFAULT_MEMBER_PERMISSIONS,
+                    })
+
+            genesis_payload = {
+                "group_sid": group_sid,
+                "half_a_dpapi_ng": base64.b64encode(protected_half_a).decode("ascii"),
+                "encrypted_fek": base64.b64encode(encrypted_fek).decode("ascii"),
+                "creator": creator_dict,
+                "initial_members": initial_members,
+                "archive": {
+                    "block_size": block_size,
+                    "block_count": block_count,
+                    "raw_block_size": raw_block_size,
+                },
+            }
+
+            genesis_block = self._sign_and_save_block(
+                index=0,
+                parents=[],
+                epoch=0,
+                action=BlockAction.GENESIS,
+                payload=genesis_payload,
+                signer_sid=creator_sid,
+                pin=pin,
+            )
+
+            if policy:
+                self.storage.write_archive_policy(policy)
+
+            creator_key = ArchiveUserKey(
+                user_sid=creator_sid,
+                fek=s_fek.to_bytes(),
+                permissions=CREATOR_PERMISSIONS,
+                epoch=0,
+            )
+
+            archive = SecureBlockArchive.create(
+                path=self.storage.archive_path,
+                block_size=block_size,
+                block_count=block_count,
+                key=creator_key,
+                policy=policy,
+                raw_block_size=raw_block_size,
+            )
+
+            return genesis_block, archive
+
+    def get_user_key(
+        self,
+        current_user_sid: str,
+        pin: Optional[str] = None,
+    ) -> ArchiveUserKey:
+        """
+        Unwraps and returns the ArchiveUserKey for the current user.
+        Authenticates against AD DPAPI-NG (Half_A) and YubiKey Slot 9d (Half_B).
+        Includes the user's active permissions and current epoch.
+        """
+        blocks = self.storage.load_all_blocks()
+        state = self.projector.project(blocks)
+
+        member = state.get_member(current_user_sid)
+        if not member:
+            raise PermissionError(f"User '{current_user_sid}' is not an authorized member in the vault ledger")
+
+        if len(state.tips) > 1:
+            self._resolve_dag_merge(state, current_user_sid, pin=pin)
+            blocks = self.storage.load_all_blocks()
+            state = self.projector.project(blocks)
+            member = state.get_member(current_user_sid)
+
+        protected_half_a = base64.b64decode(state.half_a_dpapi_ng_b64)
+        raw_half_a = self.dpapi_ng.unprotect_secret(protected_half_a)
+        raw_half_b = self.yubikey.unwrap_half_b(member.wrapped_half_b, pin=pin)
+
+        with SecureBuffer(raw_half_a) as s_ha, SecureBuffer(raw_half_b) as s_hb:
+            kek = xor_bytes(s_ha.to_bytes(), s_hb.to_bytes())
+            with SecureBuffer(kek) as s_kek:
+                encrypted_fek = base64.b64decode(state.encrypted_fek_b64)
+                fek = decrypt_aes_gcm_packed(s_kek.to_bytes(), encrypted_fek)
+                return ArchiveUserKey(
+                    user_sid=current_user_sid,
+                    fek=fek,
+                    permissions=member.permissions,
+                    epoch=state.epoch,
+                )
+
+    def open_archive(
+        self,
+        current_user_sid: str,
+        pin: Optional[str] = None,
+        auto_sync: bool = True,
+        auto_rotate: bool = True,
+    ) -> SecureBlockArchive:
+        """
+        Opens the vault's BinBin archive, returning an authorized SecureBlockArchive handle.
+        """
+        if not self.storage.has_archive():
+            raise FileNotFoundError(f"Vault archive file not found: {self.storage.archive_path}")
+
+        user_key = self.get_user_key(current_user_sid, pin=pin)
+        policy = self.storage.load_archive_policy()
+        archive = SecureBlockArchive.open(self.storage.archive_path, key=user_key, policy=policy)
+
+        if auto_sync:
+            blocks = self.storage.load_all_blocks()
+            state = self.projector.project(blocks)
+            member = state.get_member(current_user_sid)
+            if member:
+                raw_half_b = self.yubikey.unwrap_half_b(member.wrapped_half_b, pin=pin)
+                with SecureBuffer(raw_half_b) as s_hb:
+                    self._sync_peers_internal(
+                        state=state,
+                        current_user_sid=current_user_sid,
+                        current_half_b=s_hb.to_bytes(),
+                        payload_plaintext=b"",
+                        pin=pin,
+                        auto_rotate=auto_rotate,
+                    )
+
+        return archive
+
     def open_and_decrypt(
         self,
         current_user_sid: str,
@@ -324,12 +512,12 @@ class VaultOrchestrator:
     def rotate_epoch(
         self,
         current_user_sid: str,
-        payload_plaintext: bytes,
+        payload_plaintext: Optional[bytes] = None,
         pin: Optional[str] = None,
     ) -> Block:
         """
         Generates brand-new FEK, Half_A, and Half_B.
-        Re-encrypts payload and wraps new Half_B only for active, verified AD members.
+        Re-encrypts payload or archive and wraps new Half_B only for active, verified AD members.
         """
         cur_blocks = self.storage.load_all_blocks()
         state = self.projector.project(cur_blocks)
@@ -350,9 +538,21 @@ class VaultOrchestrator:
         new_epoch = state.epoch + 1
 
         with SecureBuffer(new_fek) as s_fek, SecureBuffer(new_half_a) as s_ha, SecureBuffer(new_half_b) as s_hb:
-            # Re-encrypt payload.enc
-            encrypted_payload = encrypt_aes_gcm_packed(s_fek.to_bytes(), payload_plaintext)
-            self.storage.write_payload(encrypted_payload)
+            # Re-encrypt payload.enc if present
+            if payload_plaintext is not None and (self.storage.payload_path.exists() or not self.storage.has_archive()):
+                encrypted_payload = encrypt_aes_gcm_packed(s_fek.to_bytes(), payload_plaintext)
+                self.storage.write_payload(encrypted_payload)
+
+            # Re-encrypt archive.binbin if present
+            if self.storage.has_archive():
+                new_key = ArchiveUserKey(
+                    user_sid=current_user_sid,
+                    fek=s_fek.to_bytes(),
+                    permissions=signer_member.permissions,
+                    epoch=new_epoch,
+                )
+                archive = self.open_archive(current_user_sid, pin=pin, auto_sync=False, auto_rotate=False)
+                archive.rekey_for_epoch(new_key)
 
             # Re-protect Half_A with DPAPI-NG
             new_protected_a = self.dpapi_ng.protect_secret(state.group_sid, s_ha.to_bytes())

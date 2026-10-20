@@ -25,10 +25,32 @@ class VaultStorage:
         self.blocks_dir = self.vault_dir / "blocks"
         self.payload_path = self.vault_dir / "payload.enc"
         self.genesis_path = self.vault_dir / "genesis.blk"
+        self.archive_path = self.vault_dir / "archive.binbin"
+        self.policy_path = self.vault_dir / "archive_policy.json"
 
     def ensure_directories(self) -> None:
         self.vault_dir.mkdir(parents=True, exist_ok=True)
         self.blocks_dir.mkdir(parents=True, exist_ok=True)
+
+    def has_archive(self) -> bool:
+        return self.archive_path.exists()
+
+    def write_archive_policy(self, policy: Any) -> None:
+        self.ensure_directories()
+        tmp_path = self.policy_path.with_suffix(".tmp")
+        content = policy.to_json() if hasattr(policy, "to_json") else json.dumps(policy, indent=2)
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, self.policy_path)
+
+    def load_archive_policy(self) -> Optional[Any]:
+        if not self.policy_path.exists():
+            return None
+        from yubihash.archive.policy import BlockPolicy
+        with open(self.policy_path, "r", encoding="utf-8") as f:
+            return BlockPolicy.from_json(f.read())
 
     def write_payload(self, data: bytes) -> None:
         self.ensure_directories()
