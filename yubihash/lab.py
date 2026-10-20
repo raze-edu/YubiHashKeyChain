@@ -26,8 +26,13 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
+
+# Allow direct execution: python yubihash/lab.py or python lab.py
+if __name__ == "__main__" and __package__ is None:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -313,3 +318,15 @@ class LabEnvironment:
             directory=self.directory,
             root_ca_cert=self.root_ca_cert,
         )
+
+if __name__ == '__main__':
+    lab = LabEnvironment('lab')
+    #print('Lab environment created at', lab.lab_dir)
+    #lab.add_group('test')
+    #lab.add_user('test_user', ['test',], 'test_user', 'pass1234')
+    lab.login('test_user')
+    #lab.orchestrator('test')
+    #lab.sync('test')
+    #lab.rotate-epoch('test')
+    lab.inspect('test')
+    lab.logout('test')
